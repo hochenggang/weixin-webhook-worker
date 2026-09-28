@@ -125,6 +125,23 @@ await test("GET /init 返回内联样式的页面", async () => {
   assert.match(body, /border: 10px solid/, "缺少 10px 边框");
   assert.match(body, /api\/init\/start/, "缺少初始化脚本");
 });
+await test("GET /init 的 CSP 允许同源 fetch（否则二维码加载不出来）", async () => {
+  const csp = (await call("/init")).headers.get("Content-Security-Policy") || "";
+  assert.ok(csp, "缺少 Content-Security-Policy 头");
+  // 关键：default-src 是 'none'，若 connect-src 未显式声明，fetch 会回退被拒。
+  const connect = (csp.match(/connect-src([^;]*)/) || [])[1] || "";
+  assert.ok(connect.trim(), "CSP 缺少 connect-src，会回退到 default-src 'none' 而拦截同源请求");
+  assert.ok(!/^'none'$/.test(connect.trim()), "connect-src 不能是 'none'");
+  assert.ok(connect.includes("'self'"), "connect-src 需包含 'self' 以放行同源 /api/init/*");
+
+  // 页面的请求目标必须全是同源相对路径，'self' 才够用。
+  const body = await (await call("/init")).text();
+  const targets = [...body.matchAll(/post\(\s*"([^"]+)"/g)].map((m) => m[1]);
+  assert.ok(targets.length > 0, "未找到页面的 post() 调用");
+  for (const t of targets) {
+    assert.ok(t.startsWith("/"), `请求目标 ${t} 不是同源相对路径，CSP connect-src 'self' 会拦截`);
+  }
+});
 await test("GET / 重定向到 /init", async () => {
   const res = await call("/", { redirect: "manual" });
   assert.equal(res.status, 302);
