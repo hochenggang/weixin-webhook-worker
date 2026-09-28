@@ -1,17 +1,11 @@
 name = "weixin-webhook-worker"
 main = "src/index.js"
-compatibility_date = "2026-09-28"
+compatibility_date = "2026-09-20"
 workers_dev = true
 
-# 单账号状态与令牌都存这里。
-# 刻意不写 id：留空才会触发 Cloudflare 的自动预配（部署时自动建命名空间）。
-# 若写上占位 id，Cloudflare 会当成「已存在的命名空间」去解析，从而报配置错误。
 [[kv_namespaces]]
 binding = "WEIXIN_KV"
 
 [vars]
 WEIXIN_CHANNEL_VERSION = "2.4.9"
 WEIXIN_APP_ID = "bot"
-
-[observability]
-enabled = true
