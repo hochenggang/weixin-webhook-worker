@@ -16,7 +16,10 @@
 
 [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/hochenggang/weixin-webhook-worker)
 
-点击按钮后，Cloudflare 会读取 `wrangler.toml`，自动为你创建 KV 命名空间并写入绑定 id。
+点击按钮后，Cloudflare 会读取 `wrangler.toml`，自动为你创建 KV 命名空间并绑定。
+
+> `wrangler.toml` 里的 `[[kv_namespaces]]` **刻意没有写 `id`** —— 这是触发自动预配的正确写法。
+> 写上占位 id 会被当成「已存在的命名空间」去解析，反而报配置错误。
 
 **不需要填写任何密钥。** 部署完直接访问 `/init` 即可开始扫码——
 签名密钥会在首次使用时自动生成并存进 KV。详细原理见下方「关于密钥」一节。
@@ -29,7 +32,8 @@
 npm install
 npx wrangler login
 
-# 创建 KV 并把 id 填回 wrangler.toml 的 [[kv_namespaces]]
+# 创建 KV。命令会输出 namespace id，按需填回 wrangler.toml 的 [[kv_namespaces]]；
+# 不填也行：wrangler deploy 会自动预配并把 id 写回。
 npx wrangler kv namespace create WEIXIN_KV
 
 npm run deploy
