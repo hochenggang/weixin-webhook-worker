@@ -6,7 +6,7 @@
 
 1. **点按钮部署**  
 
-[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/hochenggang/weixin-webhook-worker&branch=minimal)
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/hochenggang/weixin-webhook-worker-minimal)
 
 2. **访问 `/init` 扫码** → 手机上确认后，页面给出调用地址和通知令牌。
 3. **发通知**：
