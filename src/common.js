@@ -153,7 +153,7 @@ export function createTicketSigner({ secret, provideSecret } = {}) {
     if (typeof material !== "string" || material.length < 16) {
       throw new Error("ticket_secret_not_configured");
     }
-    const digest = await crypto.subtle.digest("SHA-256", encoder.encode(`wx-notify-ticket:${material}`));
+    const digest = await crypto.subtle.digest("SHA-256", encoder.encode(`weixin-webhook-ticket:${material}`));
     cachedKey = await crypto.subtle.importKey("raw", digest, { name: "HMAC", hash: "SHA-256" }, false, ["sign", "verify"]);
     return cachedKey;
   }

@@ -220,7 +220,7 @@ function buildCurl(endpoint, token) {
     `curl -X POST ${endpoint}`,
     `  -H "Authorization: Bearer ${token}"`,
     `  -H "Content-Type: application/json"`,
-    `  -d '{"text": "来自 wx-notify-worker 的测试消息"}'`,
+    `  -d '{"text": "来自 weixin-webhook-worker 的测试消息"}'`,
   ].join(" \\\n");
 }
 

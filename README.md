@@ -1,4 +1,4 @@
-# wx-notify-worker
+# weixin-webhook-worker
 
 把 HTTP 请求实时转发到你的微信。单账号、只用 KV、极简代码。
 

@@ -1,4 +1,4 @@
-# wx-notify-worker · 设计文档
+# weixin-webhook-worker · 设计文档
 
 把 HTTP Webhook 通知**实时转发到微信**的 Cloudflare Worker。
 
