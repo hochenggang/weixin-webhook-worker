@@ -7,7 +7,7 @@
   "cloudflare": {
     "label": "微信通知转接",
     "products": ["Workers", "KV"],
-    "categories": ["integration"],
+    "categories": ["storage"],
     "bindings": {
       "WEIXIN_KV": {
         "description": "保存微信账号凭证与签名密钥的 KV 命名空间，部署时会自动创建。"
