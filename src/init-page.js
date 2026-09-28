@@ -468,10 +468,10 @@ export const INIT_PAGE = `<!doctype html>
     document.getElementById("outEndpoint").textContent = endpoint;
     document.getElementById("outToken").textContent = token;
     document.getElementById("outCurl").textContent = result.curl ||
-      ("curl -X POST " + endpoint + " \\\n" +
-       "  -H \"Authorization: Bearer " + token + "\" \\\n" +
-       "  -H \"Content-Type: application/json\" \\\n" +
-       "  -d '{\"text\": \"这是一条微信通知\"}'");
+      ("curl -X POST " + endpoint + " \\\\\\n" +
+       "  -H \\\"Authorization: Bearer " + token + "\\\" \\\\\\n" +
+       "  -H \\\"Content-Type: application/json\\\" \\\\\\n" +
+       "  -d '{\\\"text\\\": \\\"这是一条微信通知\\\"}'");
 
     if (account.recipient) {
       var note = document.querySelector("footer");
