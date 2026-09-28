@@ -1,0 +1,16 @@
+name = "wx-notify-worker"
+main = "src/index.js"
+compatibility_date = "2026-09-28"
+workers_dev = true
+
+# 单账号状态与令牌都存这里。部署时 Cloudflare 会自动创建命名空间并回写 id。
+[[kv_namespaces]]
+binding = "WEIXIN_KV"
+id = "00000000000000000000000000000000"
+
+[vars]
+WEIXIN_CHANNEL_VERSION = "2.4.9"
+WEIXIN_APP_ID = "bot"
+
+[observability]
+enabled = true

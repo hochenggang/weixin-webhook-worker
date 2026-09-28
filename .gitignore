@@ -1,0 +1,12 @@
+.wrangler/
+node_modules/
+.dev.vars
+.dev.vars.*
+!.dev.vars.example
+.env
+.env.*
+!.env.example
+.local-session.json
+.qr-extract-*.mjs
+dist/
+coverage/

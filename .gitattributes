@@ -1,0 +1,7 @@
+# 统一按 LF 存储，避免 Windows 下 CRLF 造成无谓差异
+* text=auto eol=lf
+
+# 二进制文件不做行尾转换
+*.png binary
+*.jpg binary
+*.ico binary

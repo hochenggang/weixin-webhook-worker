@@ -1,0 +1,26 @@
+{
+  "name": "wx-notify-worker",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "把 HTTP Webhook 通知实时转发到微信的 Cloudflare Worker。单账号 + KV，无需 Cron。",
+  "cloudflare": {
+    "label": "微信通知转接",
+    "products": ["Workers", "KV"],
+    "categories": ["integration"],
+    "bindings": {
+      "WEIXIN_KV": {
+        "description": "保存微信账号凭证与签名密钥的 KV 命名空间，部署时会自动创建。"
+      }
+    }
+  },
+  "dependencies": {
+    "qrcode-svg": "1.1.0"
+  },
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "check": "wrangler deploy --dry-run",
+    "test": "node test/common.test.mjs && node test/acceptance.mjs"
+  }
+}
