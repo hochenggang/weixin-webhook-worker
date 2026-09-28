@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light">
+    <title>微信通知后台</title>
+    <link rel="stylesheet" href="/admin.css">
+    <script src="/admin.js" defer></script>
+  </head>
+  <body>
+    <main class="shell">
+      <header class="topbar">
+        <a class="brand" href="/admin" aria-label="微信通知后台首页">
+          <span class="brand-mark">微</span>
+          <span><strong>Weixin Relay</strong><small>微信通知管理</small></span>
+        </a>
+        <button id="logoutButton" class="button button-quiet" type="button" hidden>退出登录</button>
+      </header>
+
+      <section id="loginPanel" class="login-panel panel" hidden>
+        <div class="eyebrow">ADMIN CONSOLE</div>
+        <h1>登录管理后台</h1>
+        <p class="muted">使用首次初始化时设置的管理员密码登录。</p>
+        <form id="loginForm" class="stack">
+          <label for="passwordInput">管理员密码</label>
+          <input id="passwordInput" type="password" autocomplete="current-password" required maxlength="1024">
+          <button class="button button-primary" type="submit">登录</button>
+        </form>
+        <p id="loginMessage" class="message" role="status" aria-live="polite"></p>
+      </section>
+
+      <section id="setupPanel" class="login-panel panel" hidden>
+        <div class="eyebrow">FIRST-TIME SETUP</div>
+        <h1>初始化管理后台</h1>
+        <p class="muted">密码至少 8 个字符，并包含英文字母、数字和标点或符号。</p>
+        <form id="setupForm" class="stack">
+          <label for="setupPasswordInput">设置管理员密码</label>
+          <input id="setupPasswordInput" type="password" autocomplete="new-password" required minlength="8" maxlength="1024">
+          <label for="setupConfirmInput">再次输入管理员密码</label>
+          <input id="setupConfirmInput" type="password" autocomplete="new-password" required minlength="8" maxlength="1024">
+          <button class="button button-primary" type="submit">设置密码并进入后台</button>
+        </form>
+        <p id="setupMessage" class="message" role="status" aria-live="polite"></p>
+      </section>
+
+      <section id="dashboardPanel" hidden>
+        <div class="hero">
+          <div>
+            <div class="eyebrow">ACCOUNT DIRECTORY</div>
+            <h1>微信账号</h1>
+            <p class="muted">扫码连接账号，为每个账号配置收件人并生成独立 Webhook 密钥。</p>
+          </div>
+          <button id="connectButton" class="button button-primary" type="button"><span aria-hidden="true">＋</span> 连接微信</button>
+        </div>
+
+        <div id="notice" class="notice" role="status" aria-live="polite" hidden></div>
+        <div id="accountList" class="account-list"></div>
+        <div id="emptyState" class="empty-state panel" hidden>
+          <div class="empty-icon" aria-hidden="true">◎</div>
+          <h2>还没有连接账号</h2>
+          <p class="muted">点击“连接微信”，用手机微信扫描二维码完成登录。</p>
+          <button id="emptyConnectButton" class="button button-primary" type="button">连接第一个账号</button>
+        </div>
+
+        <footer class="page-footer">通知只支持纯文本。微信是否允许主动发送，取决于目标会话及微信服务端策略。</footer>
+      </section>
+    </main>
+
+    <dialog id="qrDialog" class="dialog">
+      <form method="dialog" class="dialog-close-form"><button class="icon-button" aria-label="关闭" value="close">×</button></form>
+      <div class="eyebrow">WEIXIN LINK</div>
+      <h2>扫码连接微信</h2>
+      <p id="qrStatus" class="muted" role="status" aria-live="polite">正在生成二维码…</p>
+      <div class="qr-frame"><img id="qrImage" alt="微信登录二维码" hidden></div>
+      <p id="qrCountdown" class="countdown"></p>
+      <form id="verifyForm" class="verify-form" hidden>
+        <label for="verifyCodeInput">输入微信显示的验证码</label>
+        <div class="verify-row">
+          <input id="verifyCodeInput" inputmode="numeric" pattern="[0-9]*" maxlength="12" autocomplete="one-time-code">
+          <button class="button button-primary" type="submit">提交</button>
+        </div>
+      </form>
+      <button id="retryQrButton" class="button button-secondary" type="button" hidden>重新生成二维码</button>
+    </dialog>
+
+    <dialog id="secretDialog" class="dialog secret-dialog">
+      <form method="dialog" class="dialog-close-form"><button class="icon-button" aria-label="关闭" value="close">×</button></form>
+      <div class="eyebrow">WEBHOOK CREDENTIAL</div>
+      <h2>保存这组调用信息</h2>
+      <p class="muted">密钥仅显示这一次。关闭窗口后，后台无法再次读取；遗失时请在账号卡片中轮换。</p>
+      <label>账号 ID</label>
+      <code id="secretAccountId" class="secret-value"></code>
+      <label>Webhook 密钥</label>
+      <code id="secretValue" class="secret-value"></code>
+      <button id="copySecretButton" class="button button-secondary" type="button">复制账号 ID 和密钥</button>
+      <p id="secretMessage" class="message" role="status" aria-live="polite"></p>
+    </dialog>
+  </body>
+</html>

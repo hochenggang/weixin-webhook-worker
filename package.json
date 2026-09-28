@@ -1,0 +1,9 @@
+{
+  "name": "weixin-webhook-worker",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "qrcode-svg": "1.1.0"
+  }
+}
