@@ -51,6 +51,7 @@ const ERROR_TEXT = {
   weixin_upstream_timeout: "连接微信服务超时，请稍后重试。",
   invalid_weixin_response: "微信服务返回了无法识别的响应。",
   weixin_send_failed: "微信没有接受这条消息。",
+  account_send_not_configured: "账号缺少发送所需配置，请重新连接微信账号。",
   weixin_context_missing: "还没有该收件人的微信会话上下文。请先在微信里给 OpenClaw 发一条消息，等待同步后再发送通知。",
   same_origin_required: "请求来源校验失败，请刷新后台后重试。",
   network_error: "网络请求失败，请检查连接后重试。",
@@ -185,7 +186,25 @@ function renderAccount(account) {
 
   const actions = document.createElement("div");
   actions.className = "account-actions";
+  const testMessageButton = makeButton("一键发送测试消息", "button-primary", async () => {
+    testMessageButton.disabled = true;
+    testMessageButton.textContent = "正在发送测试消息…";
+    try {
+      await api(`/api/accounts/${encodeURIComponent(account.id)}/test-message`, {
+        method: "POST",
+        body: {},
+      });
+      showNotice(`已向“${account.displayName}”发送测试消息：你好！这里是Cloudflare事务宣传部！`);
+    } catch (error) {
+      if (error.code === "admin_login_required") showLogin(errorText(error));
+      else showNotice(errorText(error), true);
+    } finally {
+      testMessageButton.disabled = false;
+      testMessageButton.textContent = "一键发送测试消息";
+    }
+  });
   actions.append(
+    testMessageButton,
     makeButton("保存设置", "button-secondary", async () => {
       try {
         const result = await api(`/api/accounts/${encodeURIComponent(account.id)}`, {

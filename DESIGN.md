@@ -37,6 +37,7 @@
 - `POST /api/admin/login`：与 D1 中保存的密码验证摘要比对，成功后发放管理员会话。
 - `POST /api/login/start`、`POST /api/login/poll`：生成二维码和推进扫码状态；支持验证码，轮询票据绑定当前管理员会话并在 5 分钟后过期。
 - `PATCH /api/accounts/:id`：修改展示名、默认收件人或轮换 Webhook 密钥。
+- `POST /api/accounts/:id/test-message`：管理员会话鉴权并校验同源后，向账号默认收件人发送固定测试文本。
 - `DELETE /api/accounts/:id`：删除连接。
 - `POST /notify`：以每账号密钥鉴权，接收 `{ "accountId": "...", "text": "..." }`。Worker 从 D1 读取并解密账号记录，按该账号默认收件人发送纯文本。Webhook 调用方不能传入任意收件人。
 - 每 5 分钟 Cron 调用 iLink `getupdates`，保存游标和默认收件人的上下文令牌；不转发或处理入站消息内容。

@@ -15,6 +15,7 @@ import {
 
 const MAX_BODY_BYTES = 16 * 1024;
 const MAX_TEXT_LENGTH = 4000;
+const TEST_MESSAGE_TEXT = "你好！这里是Cloudflare事务宣传部！";
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
 
 class ApiError extends Error {
@@ -231,6 +232,19 @@ async function handleQrPoll(request, env) {
   return jsonForStatus("confirmed", { account: accountSummary(account), webhookSecret });
 }
 
+async function sendAccountText(account, text, env) {
+  try {
+    return await sendText(account, text, env);
+  } catch (error) {
+    if (error?.message === "weixin_send_failed" && error.upstreamRet === -2) {
+      account.contextToken = "";
+      await putAccount(env, account);
+      throw new Error("weixin_context_missing");
+    }
+    throw error;
+  }
+}
+
 async function handleAccounts(request, env, url) {
   if (request.method === "GET" && url.pathname === "/api/accounts") {
     await requireAdmin(request, env);
@@ -238,12 +252,21 @@ async function handleAccounts(request, env, url) {
     return json({ ok: true, accounts: accounts.map(accountSummary) });
   }
 
+  const testMessageMatch = /^\/api\/accounts\/([0-9a-f-]+)\/test-message$/iu.exec(url.pathname);
   const match = /^\/api\/accounts\/([0-9a-f-]+)$/iu.exec(url.pathname);
-  if (!match) return null;
-  const accountId = match[1];
+  if (!testMessageMatch && !match) return null;
+  const accountId = testMessageMatch?.[1] || match[1];
   if (!UUID_RE.test(accountId)) throw new ApiError(404, "account_not_found");
   await requireAdmin(request, env);
   requireSameOrigin(request);
+
+  if (testMessageMatch) {
+    if (request.method !== "POST") return methodNotAllowed(["POST"]);
+    const account = await getAccount(env, accountId);
+    if (!account) throw new ApiError(404, "account_not_found");
+    const result = await sendAccountText(account, TEST_MESSAGE_TEXT, env);
+    return json({ ok: true, messageId: result.messageId });
+  }
 
   if (request.method === "DELETE") {
     const deleted = await deleteAccount(env, accountId);
@@ -303,17 +326,8 @@ async function handleNotify(request, env) {
   const suppliedHash = await hashSecret(bearerMatch[1]);
   if (!constantTimeStringEqual(suppliedHash, account.webhookSecretHash)) throw new ApiError(401, "unauthorized");
 
-  try {
-    const result = await sendText(account, text, env);
-    return json({ ok: true, messageId: result.messageId });
-  } catch (error) {
-    if (error?.message === "weixin_send_failed" && error.upstreamRet === -2) {
-      account.contextToken = "";
-      await putAccount(env, account);
-      throw new Error("weixin_context_missing");
-    }
-    throw error;
-  }
+  const result = await sendAccountText(account, text, env);
+  return json({ ok: true, messageId: result.messageId });
 }
 
 async function pollAccount(env, account) {

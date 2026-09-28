@@ -52,6 +52,7 @@ input:focus { border-color: #6ab590; box-shadow: 0 0 0 3px rgba(22, 132, 91, .12
 
 .button { display: inline-flex; min-height: 42px; align-items: center; justify-content: center; gap: 7px; border: 1px solid transparent; border-radius: 11px; padding: 0 15px; font-size: 13px; font-weight: 700; transition: transform .15s ease, background .15s ease, border-color .15s ease; }
 .button:hover { transform: translateY(-1px); }
+.button:disabled { cursor: wait; opacity: .65; transform: none; }
 .button:focus-visible, .icon-button:focus-visible { outline: 3px solid rgba(22, 132, 91, .25); outline-offset: 2px; }
 .button-primary { color: #fff; background: var(--green); }
 .button-primary:hover { background: var(--green-dark); }
