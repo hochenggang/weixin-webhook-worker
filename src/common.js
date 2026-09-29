@@ -19,6 +19,12 @@ export const MAX_CONTEXT_TOKEN_LENGTH = 8192;
 export const MAX_UPDATES_BUF_LENGTH = 16_384;
 export const MAX_MESSAGES = 200;
 
+/**
+ * 上游表示「bot 令牌已失活 / 会话超时」的错误码。
+ * 命中它说明这个绑定已经作废，重试无意义，需要重新扫码。
+ */
+export const STALE_TOKEN_ERRCODE = -14;
+
 export const ILINK_LOGIN_BASE_URL = "https://ilinkai.weixin.qq.com/";
 
 /**
@@ -29,6 +35,10 @@ export const ILINK_LOGIN_BASE_URL = "https://ilinkai.weixin.qq.com/";
 const QR_TIMEOUT_MS = 40_000;
 const QR_START_TIMEOUT_MS = 15_000;
 const UPDATES_TIMEOUT_MS = 40_000;
+
+/** getupdates 的本地超时下限：服务端建议值再小也不低于它。 */
+const UPDATES_MIN_TIMEOUT_MS = 10_000;
+
 const SEND_TIMEOUT_MS = 15_000;
 
 /** 长轮询重试预算：单次调用内允许的额外重试次数与间隔。 */
@@ -214,6 +224,29 @@ export function createTicketSigner({ secret, provideSecret } = {}) {
 
 /* ==================== 三、iLink 协议调用 ==================== */
 
+/**
+ * 上游错误码口径统一：`ret` 与 `errcode` 都可能承载错误
+ * （官方类型里 `errcode` 才是业务错误码，`ret` 有时只是 0 / 非 0）。
+ * 取第一个非 0 的值，都为 0 视为成功。
+ */
+function upstreamErrorCode(result) {
+  for (const key of ["errcode", "ret"]) {
+    const value = Number(result?.[key]);
+    if (Number.isInteger(value) && value !== 0) return value;
+  }
+  return 0;
+}
+
+/**
+ * 采用服务端建议的长轮询超时 `longpolling_timeout_ms`，并夹在本地护栏之间——
+ * 建议值只用来少等一会儿，不替代我们自己的上下限。
+ */
+function pollTimeoutMs(suggested) {
+  const value = Number(suggested);
+  if (!Number.isFinite(value) || value <= 0) return UPDATES_TIMEOUT_MS;
+  return Math.min(Math.max(value + 5_000, UPDATES_MIN_TIMEOUT_MS), UPDATES_TIMEOUT_MS);
+}
+
 function encodedClientVersion(version) {
   const match = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/u.exec(version);
   if (!match) throw new Error("invalid_channel_version");
@@ -253,7 +286,7 @@ function normalizeRedirectHost(value) {
  * 调用方只需知道：
  *   startQr(tokens)            → { qrcode, qrcodeImgContent, baseUrl }
  *   pollQr({ qrcode, baseUrl, verifyCode }) → { status, baseUrl?, account? }
- *   pullUpdates(account)       → { getUpdatesBuf, messages }
+ *   pullUpdates(account, opts) → { getUpdatesBuf, messages, longpollingTimeoutMs }
  *   sendText(account, text)    → { messageId }
  */
 export function createIlink({ fetch: fetchImpl, channelVersion = "2.4.9", appId = "bot" }) {
@@ -410,11 +443,19 @@ export function createIlink({ fetch: fetchImpl, channelVersion = "2.4.9", appId 
     return { status: PASSTHROUGH_QR_STATUSES.has(status) ? status : "unknown" };
   }
 
-  async function pullUpdates(account) {
+  /**
+   * 拉取一轮增量消息。
+   *
+   * `attempts` 由调用方决定重试预算：默认按长轮询的常规预算重试；
+   * 「失败后尽力补一次」这类场景应传 1，避免把调用方拖进多轮 40 秒等待。
+   */
+  async function pullUpdates(account, { attempts = RETRY_ATTEMPTS } = {}) {
     const baseUrl = normalizeBaseUrl(account.baseUrl);
     if (typeof account.botToken !== "string" || !account.botToken) throw new Error("account_send_not_configured");
 
     const endpoint = new URL("ilink/bot/getupdates", baseUrl);
+    // 前一次响应里服务端建议的超时，比本地写死的值更贴合当前网络。
+    const timeoutMs = pollTimeoutMs(account.longpollingTimeoutMs);
 
     // 长轮询：上游会挂起等待新消息（实测约 18 秒返回空）。
     // 瞬时失败在内部按预算重试，避免调用方把「暂无新消息」误判为故障。
@@ -430,12 +471,21 @@ export function createIlink({ fetch: fetchImpl, channelVersion = "2.4.9", appId 
             base_info: baseInfo(),
           }),
         },
-        UPDATES_TIMEOUT_MS,
+        timeoutMs,
       );
       if (!response.ok) throw new Error("weixin_updates_failed");
       const parsed = await readJsonFrom(response, MAX_UPDATES_RESPONSE_BYTES);
+
       // 上游明确拒绝：确定性错误，不重试。
-      if (parsed.ret !== undefined && parsed.ret !== 0) throw new Error("weixin_updates_failed");
+      const code = upstreamErrorCode(parsed);
+      if (code === STALE_TOKEN_ERRCODE) {
+        const error = new Error("weixin_bot_token_stale");
+        error.upstreamErrcode = code;
+        if (typeof parsed.errmsg === "string") error.upstreamErrmsg = parsed.errmsg;
+        throw error;
+      }
+      if (code !== 0) throw new Error("weixin_updates_failed");
+
       if (parsed.msgs !== undefined && !Array.isArray(parsed.msgs)) {
         throw new Error("invalid_weixin_updates_response");
       }
@@ -446,22 +496,32 @@ export function createIlink({ fetch: fetchImpl, channelVersion = "2.4.9", appId 
         throw new Error("invalid_weixin_updates_response");
       }
       result = parsed;
-    });
+    }, { attempts });
 
+    const suggested = Number(result.longpolling_timeout_ms);
     return {
       getUpdatesBuf: typeof result.get_updates_buf === "string" ? result.get_updates_buf : account.getUpdatesBuf || "",
       messages: (result.msgs || []).slice(-MAX_MESSAGES),
+      longpollingTimeoutMs: Number.isFinite(suggested) && suggested > 0 ? suggested : null,
     };
   }
 
+  /**
+   * 发送一条文本消息。
+   *
+   * `context_token` 是**可选**的回带字段——官方实现缺少它时只记一条告警、
+   * 照常发送。所以这里不强制要求：没有就省略该字段，有就原样回带。
+   *
+   * 失败时把上游的 status / ret / errcode / errmsg 全部挂到错误对象上，
+   * 细节留给调用方呈现，这一层不吞。
+   */
   async function sendText(account, text) {
     const baseUrl = normalizeBaseUrl(account.baseUrl);
     if (typeof account.botToken !== "string" || !account.botToken || !account.recipient) {
       throw new Error("account_send_not_configured");
     }
-    if (typeof account.contextToken !== "string" || !account.contextToken) {
-      throw new Error("weixin_context_missing");
-    }
+
+    const contextToken = typeof account.contextToken === "string" ? account.contextToken : "";
 
     const endpoint = new URL("ilink/bot/sendmessage", baseUrl);
     const response = await request(
@@ -476,7 +536,7 @@ export function createIlink({ fetch: fetchImpl, channelVersion = "2.4.9", appId 
             client_id: crypto.randomUUID(),
             message_type: 2,
             message_state: 2,
-            context_token: account.contextToken,
+            ...(contextToken ? { context_token: contextToken } : {}),
             item_list: [{ type: 1, text_item: { text } }],
           },
           base_info: baseInfo(),
@@ -486,11 +546,18 @@ export function createIlink({ fetch: fetchImpl, channelVersion = "2.4.9", appId 
     );
 
     const result = await readJsonFrom(response, MAX_RESPONSE_BYTES);
-    if (!response.ok || (result.ret !== undefined && result.ret !== 0)) {
-      const error = new Error("weixin_send_failed");
+    const code = upstreamErrorCode(result);
+
+    if (!response.ok || code !== 0) {
+      const error = new Error(code === STALE_TOKEN_ERRCODE ? "weixin_bot_token_stale" : "weixin_send_failed");
       error.upstreamStatus = response.status;
-      if (Number.isInteger(result.ret)) error.upstreamRet = result.ret;
-      if (Number.isInteger(result.errcode)) error.upstreamErrcode = result.errcode;
+      if (Number.isInteger(result.ret) && result.ret !== 0) error.upstreamRet = result.ret;
+      if (Number.isInteger(result.errcode) && result.errcode !== 0) error.upstreamErrcode = result.errcode;
+      // 上游把错误码放哪个字段并不固定，两边都空时用归一化后的值兜底。
+      if (error.upstreamRet === undefined && error.upstreamErrcode === undefined && code !== 0) {
+        error.upstreamRet = code;
+      }
+      if (typeof result.errmsg === "string" && result.errmsg) error.upstreamErrmsg = result.errmsg;
       throw error;
     }
     return { messageId: typeof result.message_id === "string" ? result.message_id : null };

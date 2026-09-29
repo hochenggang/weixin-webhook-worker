@@ -39,7 +39,11 @@ function makeUpstream() {
     qrStatus: "wait",
     /** getupdates 的回复队列，按调用次序弹出 */
     updates: [],
+    /** 下一次 sendmessage 的 ret（0 = 成功），消费一次后复位 */
     sendRet: 0,
+    /** 下一次 sendmessage 的 errcode，消费一次后复位 */
+    sendErrcode: 0,
+    sendErrmsg: "跨域请求被上游拒绝",
     /** 前 N 次 getupdates / get_qrcode_status 直接网络失败（模拟长轮询中断） */
     updatesNetworkFailTimes: 0,
     qrNetworkFailTimes: 0,
@@ -82,8 +86,12 @@ function makeUpstream() {
     }
     if (path.endsWith("/sendmessage")) {
       const ret = state.sendRet;
+      const errcode = state.sendErrcode;
       state.sendRet = 0;
-      return Response.json(ret === 0 ? { ret: 0, message_id: "MSG-X" } : { ret });
+      state.sendErrcode = 0;
+      if (ret !== 0) return Response.json({ ret, errmsg: state.sendErrmsg });
+      if (errcode !== 0) return Response.json({ ret: 0, errcode, errmsg: state.sendErrmsg });
+      return Response.json({ ret: 0, message_id: "MSG-X" });
     }
     throw new Error("unexpected upstream path: " + path);
   };
@@ -345,6 +353,34 @@ await test("pullUpdates 业务错误(ret!=0)不重试，直接抛出", async () 
     "确定性业务错误只应请求一次",
   );
 });
+await test("pullUpdates 透传服务端建议的 longpolling_timeout_ms", async () => {
+  const upstream = makeUpstream();
+  upstream.state.updates.push({ ret: 0, get_updates_buf: "BUF-1", msgs: [], longpolling_timeout_ms: 20000 });
+  const result = await ilinkOf(upstream).pullUpdates({ baseUrl: "https://a/", botToken: "t" });
+  assert.equal(result.longpollingTimeoutMs, 20000, "应把服务端建议的超时带出来供下次使用");
+});
+await test("pullUpdates 支持只拉一轮（attempts=1 不重试）", async () => {
+  const upstream = makeUpstream();
+  upstream.state.updatesNetworkFailTimes = 5;
+  await assert.rejects(
+    () => ilinkOf(upstream).pullUpdates({ baseUrl: "https://a/", botToken: "t" }, { attempts: 1 }),
+    /weixin_upstream_unreachable/,
+  );
+  assert.equal(
+    upstream.log.filter((entry) => entry.path.endsWith("/getupdates")).length,
+    1,
+    "attempts=1 只应请求一次，不给调用方叠加 40 秒等待",
+  );
+});
+await test("pullUpdates errcode=-14 归类为 bot 令牌失活", async () => {
+  const upstream = makeUpstream();
+  upstream.state.updates.push({ ret: 0, errcode: -14, errmsg: "session timeout" });
+  const error = await ilinkOf(upstream)
+    .pullUpdates({ baseUrl: "https://a/", botToken: "t" })
+    .then(() => null, (caught) => caught);
+  assert.equal(error.message, "weixin_bot_token_stale");
+  assert.equal(error.upstreamErrmsg, "session timeout");
+});
 await test("pollQr 瞬时网络失败后自动重试并成功", async () => {
   const upstream = makeUpstream();
   upstream.state.qrNetworkFailTimes = 1;
@@ -370,12 +406,20 @@ await test("pollQr 持续失败时最终抛出，不会无限重试", async () =
     "重试预算耗尽后应停止（默认 3 次）",
   );
 });
-await test("sendText 缺少 contextToken 时报错", async () => {
+await test("sendText 无 contextToken 也能发送，且请求体省略该字段", async () => {
   const upstream = makeUpstream();
-  await assert.rejects(
-    () => ilinkOf(upstream).sendText({ baseUrl: "https://a/", botToken: "t", recipient: "r" }, "hi"),
-    /weixin_context_missing/,
+  const result = await ilinkOf(upstream).sendText({ baseUrl: "https://a/", botToken: "t", recipient: "r" }, "hi");
+  assert.equal(result.messageId, "MSG-X");
+  const sent = upstream.log.at(-1).body;
+  assert.equal("context_token" in sent.msg, false, "空令牌时不应出现 context_token 字段");
+});
+await test("sendText 有 contextToken 时原样回带", async () => {
+  const upstream = makeUpstream();
+  await ilinkOf(upstream).sendText(
+    { baseUrl: "https://a/", botToken: "t", recipient: "r", contextToken: "CTX-1" },
+    "hi",
   );
+  assert.equal(upstream.log.at(-1).body.msg.context_token, "CTX-1");
 });
 await test("sendText 缺收件人时报错", async () => {
   const upstream = makeUpstream();
@@ -384,14 +428,24 @@ await test("sendText 缺收件人时报错", async () => {
     /account_send_not_configured/,
   );
 });
-await test("sendText ret=-2 时带出 upstreamRet", async () => {
+await test("sendText ret!=0 时带出 ret 与上游 errmsg", async () => {
   const upstream = makeUpstream();
   upstream.state.sendRet = -2;
   const error = await ilinkOf(upstream)
-    .sendText({ baseUrl: "https://a/", botToken: "t", recipient: "r", contextToken: "c" }, "hi")
+    .sendText({ baseUrl: "https://a/", botToken: "t", recipient: "r" }, "hi")
     .then(() => null, (caught) => caught);
   assert.equal(error.message, "weixin_send_failed");
   assert.equal(error.upstreamRet, -2);
+  assert.equal(error.upstreamErrmsg, "跨域请求被上游拒绝", "应把上游原话带出来供诊断");
+});
+await test("sendText errcode=-14 归类为 bot 令牌失活", async () => {
+  const upstream = makeUpstream();
+  upstream.state.sendErrcode = -14;
+  const error = await ilinkOf(upstream)
+    .sendText({ baseUrl: "https://a/", botToken: "t", recipient: "r" }, "hi")
+    .then(() => null, (caught) => caught);
+  assert.equal(error.message, "weixin_bot_token_stale");
+  assert.equal(error.upstreamErrcode, -14, "应带出上游 errcode 供诊断");
 });
 await test("sendText 成功返回 messageId", async () => {
   const upstream = makeUpstream();

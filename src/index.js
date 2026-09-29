@@ -15,12 +15,9 @@
 
 import QRCode from "qrcode-svg";
 import {
-  accountChanged,
-  applyUpdates,
   createAccount,
   createIlink,
   createTicketSigner,
-  invalidateContext,
   normalizeText,
   normalizeVerifyCode,
   randomToken,
@@ -226,14 +223,16 @@ function buildCurl(endpoint, token) {
 
 /* --------------------------- 实时转发 --------------------------- */
 
-/** 拉取一轮增量消息并落库，返回最新的账号状态。 */
-async function pullAndPersist(ilink, env, account) {
-  const updates = await ilink.pullUpdates(account);
-  const next = applyUpdates(account, updates);
-  if (accountChanged(account, next)) await putAccount(env, next);
-  return next;
-}
-
+/**
+ * 发送文本通知。
+ *
+ * 默认**不带 `context_token`**：它在官方实现里是可选的会话标识，缺失时只记
+ * 一条告警、照常发送；带上它却要先跑一轮 getupdates 长轮询（实测挂起约
+ * 18 秒），等于把延迟灌进通知链路。
+ *
+ * 失败不做任何补救——把上游返回的 status / ret / errcode / errmsg 原样带出去，
+ * 让调用方看到失败的真实原因，而不是一个被我们翻译过的模糊结论。
+ */
 async function handleNotify(request, env) {
   if (request.method !== "POST") return methodNotAllowed(["POST"]);
 
@@ -252,28 +251,8 @@ async function handleNotify(request, env) {
   }
 
   const { ilink } = context(env);
-  let current = account;
-
-  // 首次或更换收件人后上下文为空：同步补一次，拿到就发。
-  if (!current.contextToken) {
-    current = await pullAndPersist(ilink, env, current);
-  }
-
-  try {
-    const result = await ilink.sendText(current, text);
-    return json({ ok: true, messageId: result.messageId });
-  } catch (error) {
-    if (error?.message !== "weixin_send_failed" || error.upstreamRet !== -2) throw error;
-
-    // 上下文已失效：重置游标后重新捕获，再试一次。
-    const reset = invalidateContext(current);
-    await putAccount(env, reset);
-    const refreshed = await pullAndPersist(ilink, env, reset);
-    if (!refreshed.contextToken) throw new ApiError(409, "weixin_context_missing");
-
-    const result = await ilink.sendText(refreshed, text);
-    return json({ ok: true, messageId: result.messageId });
-  }
+  const result = await ilink.sendText(account, text);
+  return json({ ok: true, messageId: result.messageId });
 }
 
 /* ---------------------------- 错误映射 ---------------------------- */
@@ -292,7 +271,6 @@ const ERROR_STATUSES = new Map([
   ["text_too_long", 413],
   ["invalid_verify_code", 400],
   ["account_send_not_configured", 502],
-  ["weixin_context_missing", 409],
   ["weixin_upstream_unreachable", 502],
   ["weixin_upstream_timeout", 504],
   ["weixin_qr_start_failed", 502],
@@ -314,14 +292,18 @@ function safeErrorResponse(error) {
 
   const code = typeof error?.message === "string" ? error.message : "";
 
-  if (code === "weixin_send_failed") {
+  // 上游拒绝时把它的原话一并带出：调用方要的是可诊断的事实，不是转述。
+  if (code === "weixin_send_failed" || code === "weixin_bot_token_stale") {
     return json({
       ok: false,
       error: code,
       ...(Number.isInteger(error.upstreamStatus) ? { upstreamStatus: error.upstreamStatus } : {}),
       ...(Number.isInteger(error.upstreamRet) ? { upstreamRet: error.upstreamRet } : {}),
       ...(Number.isInteger(error.upstreamErrcode) ? { upstreamErrcode: error.upstreamErrcode } : {}),
-    }, 502);
+      ...(typeof error.upstreamErrmsg === "string" && error.upstreamErrmsg
+        ? { upstreamErrmsg: error.upstreamErrmsg }
+        : {}),
+    }, code === "weixin_bot_token_stale" ? 503 : 502);
   }
 
   const qrHttpFailure = /^weixin_qr_upstream_http_(\d{3})$/u.exec(code);

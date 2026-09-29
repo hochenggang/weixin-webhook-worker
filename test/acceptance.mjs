@@ -22,10 +22,11 @@ function makeUpstream() {
   const calls = { qrStart: 0, qrPoll: 0, updates: 0, send: 0, updatesBodies: [], sendBodies: [] };
   const state = {
     qrStatus: "wait",
-    /** 前 N 次 sendmessage 返回 ret=-2 */
-    sendFailTimes: 0,
-    /** 当前是否还有可捕获的上下文 */
-    hasContext: true,
+    /** 下一次 sendmessage 的 ret（0 = 成功），消费一次后复位 */
+    sendRet: 0,
+    /** 下一次 sendmessage 的 errcode，消费一次后复位 */
+    sendErrcode: 0,
+    sendErrmsg: "上游拒绝了这条消息",
   };
 
   const fetchImpl = async (input, init) => {
@@ -52,19 +53,20 @@ function makeUpstream() {
     if (path.endsWith("/getupdates")) {
       calls.updates += 1;
       calls.updatesBodies.push(body);
-      // 游标为空时才重放历史，模拟上游"已消费不再重发"的语义。
-      const replaying = !body.get_updates_buf;
-      const msgs = state.hasContext && replaying
-        ? [{ from_user_id: "USER-SCANNER-1", context_token: "CTX-1" }]
-        : [];
-      return Response.json({ ret: 0, get_updates_buf: "BUF-2", msgs });
+      return Response.json({ ret: 0, get_updates_buf: "BUF-2", msgs: [] });
     }
     if (path.endsWith("/sendmessage")) {
       calls.send += 1;
       calls.sendBodies.push(body);
-      if (state.sendFailTimes > 0) {
-        state.sendFailTimes -= 1;
-        return Response.json({ ret: -2 });
+      if (state.sendErrcode !== 0) {
+        const errcode = state.sendErrcode;
+        state.sendErrcode = 0;
+        return Response.json({ ret: 0, errcode, errmsg: state.sendErrmsg });
+      }
+      if (state.sendRet !== 0) {
+        const ret = state.sendRet;
+        state.sendRet = 0;
+        return Response.json({ ret, errmsg: state.sendErrmsg });
       }
       return Response.json({ ret: 0, message_id: "MSG-1" });
     }
@@ -257,68 +259,60 @@ await test("非 JSON 请求体 415", async () => {
   });
   assert.equal(res.status, 415);
 });
-await test("首次通知：自动补上下文后发送", async () => {
+await test("首次通知：不带 context_token 直接发送，不触发任何拉取", async () => {
   const before = upstream.calls.updates;
   const res = await notify({ text: "这是一条微信通知" });
   assert.equal(res.status, 200);
   assert.equal((await res.json()).messageId, "MSG-1");
-  assert.equal(upstream.calls.updates, before + 1, "应触发一次补上下文");
+  assert.equal(upstream.calls.updates, before, "不应触发 getupdates 长轮询");
   const sent = upstream.calls.sendBodies.at(-1);
   assert.equal(sent.msg.to_user_id, "USER-SCANNER-1");
-  assert.equal(sent.msg.context_token, "CTX-1");
+  assert.equal("context_token" in sent.msg, false, "默认不带 context_token");
   assert.equal(sent.msg.message_type, 2);
   assert.equal(sent.msg.item_list[0].text_item.text, "这是一条微信通知");
 });
-await test("状态已持久化", async () => {
-  const stored = JSON.parse(env.WEIXIN_KV.map.get("account"));
-  assert.equal(stored.getUpdatesBuf, "BUF-2");
-  assert.equal(stored.contextToken, "CTX-1");
-});
-await test("第二次通知走缓存，不再拉取", async () => {
-  const before = upstream.calls.updates;
+await test("发送链路不写 KV（没有上下文状态需要维护）", async () => {
+  const before = env.WEIXIN_KV.map.get("account");
   assert.equal((await notify({ text: "第二条" })).status, 200);
+  assert.equal(env.WEIXIN_KV.map.get("account"), before, "发送成功后不应落库");
+});
+await test("连续发送都不再触发拉取", async () => {
+  const before = upstream.calls.updates;
+  const sendsBefore = upstream.calls.send;
+  assert.equal((await notify({ text: "第三条" })).status, 200);
   assert.equal(upstream.calls.updates, before, "不应再次拉取");
+  assert.equal(upstream.calls.send, sendsBefore + 1, "一次通知只应发一次");
 });
 
-/* ==================== 上下文失效的恢复（回归） ==================== */
-console.log("\n[上下文失效恢复]");
+/* ==================== 失败透传（不做任何补救） ==================== */
+console.log("\n[失败透传]");
 
-await test("上下文失效：重置游标后能重新捕获并发送成功", async () => {
-  upstream.state.sendFailTimes = 1;
-  const updatesBefore = upstream.calls.updates;
-  const res = await notify({ text: "第三条" });
-  assert.equal(res.status, 200, "重试应成功");
-  assert.ok(upstream.calls.updates > updatesBefore, "应重新拉取上下文");
-  const bodies = upstream.calls.updatesBodies.slice(updatesBefore);
-  assert.ok(
-    bodies.some((body) => !body.get_updates_buf),
-    "重建时必须用空游标拉取，否则上游不会重放历史消息",
-  );
-  const stored = JSON.parse(env.WEIXIN_KV.map.get("account"));
-  assert.equal(stored.contextToken, "CTX-1", "上下文应被重新捕获");
+await test("上游拒绝时原样带出 ret / errmsg，且不做重试", async () => {
+  upstream.state.sendRet = -2;
+  const sendsBefore = upstream.calls.send;
+  const res = await notify({ text: "会被拒" });
+  assert.equal(res.status, 502);
+  assert.equal(upstream.calls.send, sendsBefore + 1, "失败应直接透出，不该再补发一次");
+  const body = await res.json();
+  assert.equal(body.error, "weixin_send_failed");
+  assert.equal(body.upstreamRet, -2);
+  assert.equal(body.upstreamErrmsg, "上游拒绝了这条消息", "上游原话要能看到");
 });
-await test("上游确实拿不到上下文时返回 409", async () => {
-  upstream.state.sendFailTimes = 1;
-  upstream.state.hasContext = false;
-  const stored = JSON.parse(env.WEIXIN_KV.map.get("account"));
-  stored.contextToken = "";
-  await env.WEIXIN_KV.put("account", JSON.stringify(stored));
-  const res = await notify({ text: "第四条" });
-  assert.equal(res.status, 409);
-  assert.equal((await res.json()).error, "weixin_context_missing");
+await test("errcode=-14 归类为令牌失活并返回 503", async () => {
+  upstream.state.sendErrcode = -14;
+  const res = await notify({ text: "令牌失活" });
+  assert.equal(res.status, 503);
+  const body = await res.json();
+  assert.equal(body.error, "weixin_bot_token_stale");
+  assert.equal(body.upstreamErrcode, -14);
 });
 
 /* ============================ 反向自检 ============================ */
 console.log("\n[反向自检]");
 
-await test("恢复上下文后，正常发送仍可用", async () => {
-  upstream.state.hasContext = true;
-  upstream.state.sendFailTimes = 0;
-  // 上一条测试把状态打成了「上下文为空 + 游标已推进」，先重置到可恢复状态。
-  const stored = JSON.parse(env.WEIXIN_KV.map.get("account"));
-  stored.contextToken = "";
-  stored.getUpdatesBuf = "";
-  await env.WEIXIN_KV.put("account", JSON.stringify(stored));
+await test("失败状态复位后，正常发送仍然可用", async () => {
+  upstream.state.sendRet = 0;
+  upstream.state.sendErrcode = 0;
   assert.equal((await notify({ text: "第五条" })).status, 200);
 });
 await test("错误令牌不能绕过（证明鉴权真在跑）", async () => {

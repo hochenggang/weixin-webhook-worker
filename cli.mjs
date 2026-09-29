@@ -20,12 +20,9 @@ import { fileURLToPath } from "node:url";
 import QRCode from "qrcode-svg";
 
 import {
-  accountChanged,
-  applyUpdates,
   createAccount,
   createIlink,
   createTicketSigner,
-  invalidateContext,
   normalizeText,
   randomToken,
   TICKET_SECONDS,
@@ -64,14 +61,6 @@ async function saveSession(session) {
   await writeFile(SESSION_FILE, JSON.stringify(session, null, 2), "utf8");
 }
 
-/**
- * 基于本地账号状态与一轮上游消息，算出新状态。
- * 与 Worker 里的持久化策略共用同一套纯函数。
- */
-function advanceSession(session, updates) {
-  return applyUpdates(session, updates);
-}
-
 /* ============================ 远端交互 ============================ */
 
 function makeIlink() {
@@ -82,38 +71,14 @@ function makeIlink() {
   });
 }
 
-/** 拉取一轮增量消息并写回本地文件；用于补齐 contextToken。 */
-async function refreshContext(ilink, session, { label = "" } = {}) {
-  const updates = await ilink.pullUpdates(session);
-  const next = advanceSession(session, updates);
-  if (accountChanged(session, next)) await saveSession(next);
-  if (label) {
-    console.log(dim(`  ${label}：游标 ${next.getUpdatesBuf || "(空)"}，上下文 ${next.contextToken ? "已获取" : "仍为空"}`));
-  }
-  return next;
-}
-
-/** 发送文本。上下文失效时按 Worker 相同策略重置游标并重试一次。 */
-async function deliver(ilink, session, text) {
-  let current = session;
-
-  if (!current.contextToken) {
-    console.log(dim("  上下文为空，正在向微信拉取…"));
-    current = await refreshContext(ilink, session, { label: "拉取结果" });
-  }
-
-  try {
-    return { session: current, result: await ilink.sendText(current, text) };
-  } catch (error) {
-    if (error?.message !== "weixin_send_failed" || error.upstreamRet !== -2) throw error;
-
-    console.log(dim("  上下文已失效，重置游标后重新拉取…"));
-    const reset = invalidateContext(current);
-    await saveSession(reset);
-    const refreshed = await refreshContext(ilink, reset, { label: "重新拉取" });
-    if (!refreshed.contextToken) throw new Error("weixin_context_missing");
-    return { session: refreshed, result: await ilink.sendText(refreshed, text) };
-  }
+/** 把上游拒绝的细节拼成一行，终端里一眼能看到真实原因。 */
+function upstreamDetail(error) {
+  return [
+    error.upstreamStatus ? `status=${error.upstreamStatus}` : "",
+    error.upstreamRet !== undefined ? `ret=${error.upstreamRet}` : "",
+    error.upstreamErrcode !== undefined ? `errcode=${error.upstreamErrcode}` : "",
+    error.upstreamErrmsg ? `errmsg=${error.upstreamErrmsg}` : "",
+  ].filter(Boolean).join(" ");
 }
 
 /* ============================ 二维码渲染 ============================ */
@@ -291,8 +256,9 @@ async function cmdLogin() {
   console.log(deep("\n连接成功。"));
   console.log(dim(`  凭证已保存到 ${SESSION_FILE}`));
   console.log(dim(`  默认收件人：${session.recipient}\n`));
-  console.log(mid("下一步：让该收件人给这个微信账号发一条消息，然后执行"));
+  console.log(mid("下一步：让该收件人在微信里给这个机器人发一条消息，然后执行"));
   console.log("  " + bold("node cli.mjs send \"这是一条测试通知\"") + "\n");
+  console.log(dim("注意：微信只允许在收件人最后一次发消息后的 24 小时内下发，且每次最多 10 条。\n"));
 }
 
 async function cmdStatus() {
@@ -305,12 +271,10 @@ async function cmdStatus() {
   console.log(`  默认收件人   ${session.recipient}`);
   console.log(`  机器人 ID    ${session.botId}`);
   console.log(`  登录节点     ${session.baseUrl}`);
-  console.log(`  消息游标     ${session.getUpdatesBuf || dim("(空)")}`);
-  console.log(`  上下文令牌   ${session.contextToken ? deep("已获取") : mid("尚未获取")}`);
+  if (session.createdAt) console.log(`  绑定时间     ${new Date(session.createdAt).toLocaleString()}`);
   console.log();
-  if (!session.contextToken) {
-    console.log(dim("  上下文尚未获取：请让收件人先给这个微信账号发一条消息。\n"));
-  }
+  console.log(dim("  发送时不带会话上下文，能否送达取决于收件人是否在 24 小时内"));
+  console.log(dim("  给过这个微信号发消息——对方每发一条，窗口与 10 条配额都会重置。\n"));
 }
 
 async function cmdSend(text) {
@@ -335,21 +299,19 @@ async function cmdSend(text) {
   const ilink = makeIlink();
   console.log(bold("\n发送通知\n"));
   try {
-    const { result } = await deliver(ilink, session, normalized);
-    console.log(deep(`\n已发送。messageId = ${result.messageId}\n`));
+    const result = await ilink.sendText(session, normalized);
+    console.log(deep(`\n已发送。messageId = ${result.messageId ?? "(上游未返回)"}\n`));
   } catch (error) {
     const code = error?.message || "internal_error";
-    if (code === "weixin_context_missing") {
-      console.error(mid("\n还没有该收件人的会话上下文。"));
-      console.error(dim("请让收件人先给这个微信账号发一条消息，然后重试。\n"));
-      process.exit(1);
-    }
-    const extra = [
-      error.upstreamStatus ? `status=${error.upstreamStatus}` : "",
-      error.upstreamRet !== undefined ? `ret=${error.upstreamRet}` : "",
-      error.upstreamErrcode !== undefined ? `errcode=${error.upstreamErrcode}` : "",
-    ].filter(Boolean).join(" ");
+    const extra = upstreamDetail(error);
     console.error(bad(`\n发送失败：${code}${extra ? " (" + extra + ")" : ""}\n`));
+
+    if (code === "weixin_bot_token_stale") {
+      console.error(dim("机器人令牌已失活，需要 logout 后重新 login 扫码。\n"));
+    } else if (error.upstreamRet === -2 || error.upstreamErrcode === -2) {
+      console.error(mid("上游不接受这条会话。最常见的原因是收件人的 24 小时回复窗口已关闭："));
+      console.error(dim("让对方在微信里给这个机器人发一条消息，窗口与 10 条配额就会重置。\n"));
+    }
     process.exit(1);
   }
 }
