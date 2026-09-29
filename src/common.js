@@ -5,19 +5,18 @@
  * 都由调用方以参数注入。调用方只需知道"传入什么、拿回什么"。
  *
  * 组成：
- *   1. 协议调用      createIlink({ fetch, env })  → startQr / pollQr / pullUpdates / sendText
+ *   1. 协议调用      createIlink({ fetch, env })  → startQr / pollQr / sendText
  *   2. 票据签名      createTicketSigner({ secret })
- *   3. 上下文捕获    applyUpdates(account, updates) → 新账号状态
- *   4. 令牌校验      tokenMatches / readBearerToken
+ *   3. 令牌校验      tokenMatches / readBearerToken
+ *
+ * 只实现协议里真正用到的那部分：单向推送链路 = 扫码登录 + 发消息。
+ * 没有接收侧，因此不涉及 getupdates 与上下文游标。
  */
 
 /* ============================ 常量 ============================ */
 
 export const TICKET_SECONDS = 5 * 60;
 export const MAX_TEXT_LENGTH = 4000;
-export const MAX_CONTEXT_TOKEN_LENGTH = 8192;
-export const MAX_UPDATES_BUF_LENGTH = 16_384;
-export const MAX_MESSAGES = 200;
 
 /**
  * 上游表示「bot 令牌已失活 / 会话超时」的错误码。
@@ -25,19 +24,16 @@ export const MAX_MESSAGES = 200;
  */
 export const STALE_TOKEN_ERRCODE = -14;
 
-export const ILINK_LOGIN_BASE_URL = "https://ilinkai.weixin.qq.com/";
+/** 二维码登录的固定入口；服务端可能返回区域节点，由 pollQr 的 redirect 处理。 */
+const ILINK_LOGIN_BASE_URL = "https://ilinkai.weixin.qq.com/";
 
 /**
- * 上游超时。注意 getupdates / get_qrcode_status 都是**长轮询**：
- * 实测 getupdates 会挂起约 18 秒才返回，get_qrcode_status 类似。
- * 因此这里的值必须明显大于上游的挂起时长，否则每轮都会被我们自己掐断。
+ * 上游超时。注意 get_qrcode_status 是**长轮询**：
+ * 实测会挂起约 18 秒才返回，因此这里的值必须明显大于挂起时长，
+ * 否则每轮都会被我们自己掐断。
  */
 const QR_TIMEOUT_MS = 40_000;
 const QR_START_TIMEOUT_MS = 15_000;
-const UPDATES_TIMEOUT_MS = 40_000;
-
-/** getupdates 的本地超时下限：服务端建议值再小也不低于它。 */
-const UPDATES_MIN_TIMEOUT_MS = 10_000;
 
 const SEND_TIMEOUT_MS = 15_000;
 
@@ -47,13 +43,12 @@ const RETRY_DELAY_MS = 1_000;
 
 const MAX_RESPONSE_BYTES = 32 * 1024;
 const MAX_QR_RESPONSE_BYTES = 16 * 1024;
-const MAX_UPDATES_RESPONSE_BYTES = 256 * 1024;
 
 /**
  * 属于「这一轮没拿到数据」的瞬时错误，值得重试。
  *
- * 只包含传输层故障（超时、连不上）。上游明确返回的业务错误
- * （如 getupdates 的 ret!=0）是确定性拒绝，重试无意义，用独立错误码区分。
+ * 只包含传输层故障（超时、连不上）。上游明确返回的业务错误是确定性拒绝，
+ * 重试无意义，用独立错误码区分。
  */
 const RETRYABLE_ERRORS = new Set([
   "weixin_upstream_timeout",
@@ -225,9 +220,11 @@ export function createTicketSigner({ secret, provideSecret } = {}) {
 /* ==================== 三、iLink 协议调用 ==================== */
 
 /**
- * 上游错误码口径统一：`ret` 与 `errcode` 都可能承载错误
- * （官方类型里 `errcode` 才是业务错误码，`ret` 有时只是 0 / 非 0）。
- * 取第一个非 0 的值，都为 0 视为成功。
+ * 归一化上游的业务返回码。
+ *
+ * 协议里 `ret` 是每类响应都有的状态码（`0` 表示成功），`errcode` 是
+ * 「可选的应用错误码」（协议「返回值和错误」一节）。两者任一非 0 都算失败，
+ * 取第一个非 0 的值；判断只依据这两个字段本身。
  */
 function upstreamErrorCode(result) {
   for (const key of ["errcode", "ret"]) {
@@ -238,13 +235,18 @@ function upstreamErrorCode(result) {
 }
 
 /**
- * 采用服务端建议的长轮询超时 `longpolling_timeout_ms`，并夹在本地护栏之间——
- * 建议值只用来少等一会儿，不替代我们自己的上下限。
+ * 把上游响应里属于协议本身的字段**原样搬运**：不改名、不补默认值、不翻译。
+ * 上游没说的事，我们不替它说；上游说了的事，我们一个字都不动。
+ *
+ * 只取协议里定义的那三个：`ret`（状态码，`0` 表示成功）、`errcode`
+ * （可选的应用错误码）、`errmsg`（可选的错误描述）。
  */
-function pollTimeoutMs(suggested) {
-  const value = Number(suggested);
-  if (!Number.isFinite(value) || value <= 0) return UPDATES_TIMEOUT_MS;
-  return Math.min(Math.max(value + 5_000, UPDATES_MIN_TIMEOUT_MS), UPDATES_TIMEOUT_MS);
+function upstreamFields(result) {
+  const picked = {};
+  for (const key of ["ret", "errcode", "errmsg"]) {
+    if (result?.[key] !== undefined) picked[key] = result[key];
+  }
+  return picked;
 }
 
 function encodedClientVersion(version) {
@@ -286,8 +288,7 @@ function normalizeRedirectHost(value) {
  * 调用方只需知道：
  *   startQr(tokens)            → { qrcode, qrcodeImgContent, baseUrl }
  *   pollQr({ qrcode, baseUrl, verifyCode }) → { status, baseUrl?, account? }
- *   pullUpdates(account, opts) → { getUpdatesBuf, messages, longpollingTimeoutMs }
- *   sendText(account, text)    → { messageId }
+ *   sendText(account, text)    → 上游字段（ret / errcode / errmsg 原样）
  */
 export function createIlink({ fetch: fetchImpl, channelVersion = "2.4.9", appId = "bot" }) {
   if (typeof fetchImpl !== "function") throw new Error("fetch_not_injected");
@@ -349,15 +350,15 @@ export function createIlink({ fetch: fetchImpl, channelVersion = "2.4.9", appId 
    * 长轮询本来就会周期性「没等到数据」，把它当致命错误会让调用方无故中断，
    * 所以统一在这里兜住。确定性错误原样抛出，不做无意义重试。
    */
-  async function withRetry(operation, { attempts = RETRY_ATTEMPTS, delayMs = RETRY_DELAY_MS } = {}) {
+  async function withRetry(operation) {
     let lastError;
-    for (let attempt = 0; attempt < attempts; attempt += 1) {
+    for (let attempt = 0; attempt < RETRY_ATTEMPTS; attempt += 1) {
       try {
         return await operation();
       } catch (error) {
         lastError = error;
-        if (!RETRYABLE_ERRORS.has(error?.message) || attempt + 1 >= attempts) throw error;
-        await new Promise((resolve) => setTimeout(resolve, delayMs));
+        if (!RETRYABLE_ERRORS.has(error?.message) || attempt + 1 >= RETRY_ATTEMPTS) throw error;
+        await new Promise((resolve) => setTimeout(resolve, RETRY_DELAY_MS));
       }
     }
     throw lastError;
@@ -444,84 +445,24 @@ export function createIlink({ fetch: fetchImpl, channelVersion = "2.4.9", appId 
   }
 
   /**
-   * 拉取一轮增量消息。
+   * 发送一条文本消息，返回上游响应里的协议字段（`ret` / `errcode` / `errmsg`）。
    *
-   * `attempts` 由调用方决定重试预算：默认按长轮询的常规预算重试；
-   * 「失败后尽力补一次」这类场景应传 1，避免把调用方拖进多轮 40 秒等待。
-   */
-  async function pullUpdates(account, { attempts = RETRY_ATTEMPTS } = {}) {
-    const baseUrl = normalizeBaseUrl(account.baseUrl);
-    if (typeof account.botToken !== "string" || !account.botToken) throw new Error("account_send_not_configured");
-
-    const endpoint = new URL("ilink/bot/getupdates", baseUrl);
-    // 前一次响应里服务端建议的超时，比本地写死的值更贴合当前网络。
-    const timeoutMs = pollTimeoutMs(account.longpollingTimeoutMs);
-
-    // 长轮询：上游会挂起等待新消息（实测约 18 秒返回空）。
-    // 瞬时失败在内部按预算重试，避免调用方把「暂无新消息」误判为故障。
-    let result;
-    await withRetry(async () => {
-      const response = await request(
-        endpoint,
-        {
-          method: "POST",
-          headers: requestHeaders({ token: account.botToken, json: true }),
-          body: JSON.stringify({
-            get_updates_buf: typeof account.getUpdatesBuf === "string" ? account.getUpdatesBuf : "",
-            base_info: baseInfo(),
-          }),
-        },
-        timeoutMs,
-      );
-      if (!response.ok) throw new Error("weixin_updates_failed");
-      const parsed = await readJsonFrom(response, MAX_UPDATES_RESPONSE_BYTES);
-
-      // 上游明确拒绝：确定性错误，不重试。
-      const code = upstreamErrorCode(parsed);
-      if (code === STALE_TOKEN_ERRCODE) {
-        const error = new Error("weixin_bot_token_stale");
-        error.upstreamErrcode = code;
-        if (typeof parsed.errmsg === "string") error.upstreamErrmsg = parsed.errmsg;
-        throw error;
-      }
-      if (code !== 0) throw new Error("weixin_updates_failed");
-
-      if (parsed.msgs !== undefined && !Array.isArray(parsed.msgs)) {
-        throw new Error("invalid_weixin_updates_response");
-      }
-      if (
-        parsed.get_updates_buf !== undefined &&
-        (typeof parsed.get_updates_buf !== "string" || parsed.get_updates_buf.length > MAX_UPDATES_BUF_LENGTH)
-      ) {
-        throw new Error("invalid_weixin_updates_response");
-      }
-      result = parsed;
-    }, { attempts });
-
-    const suggested = Number(result.longpolling_timeout_ms);
-    return {
-      getUpdatesBuf: typeof result.get_updates_buf === "string" ? result.get_updates_buf : account.getUpdatesBuf || "",
-      messages: (result.msgs || []).slice(-MAX_MESSAGES),
-      longpollingTimeoutMs: Number.isFinite(suggested) && suggested > 0 ? suggested : null,
-    };
-  }
-
-  /**
-   * 发送一条文本消息。
+   * 请求体只放协议要求的字段，`context_token` 不在其列：它是「回复某条会话」时
+   * 才需要回带的关联字段，而本服务是单向推送、不接收消息，因此永远省略。
+   * 协议里它是可选的，省略合法。
    *
-   * `context_token` 是**可选**的回带字段——官方实现缺少它时只记一条告警、
-   * 照常发送。所以这里不强制要求：没有就省略该字段，有就原样回带。
+   * **成功与否只看协议字段**：`ret` / `errcode` 非 0，或 `errmsg` 非空
+   * （协议称其为「可选的错误描述」，成功示例里它是空串），都算没成功。
+   * 不引入协议之外的经验判据——上游给什么，我们就如实转述什么。
    *
-   * 失败时把上游的 status / ret / errcode / errmsg 全部挂到错误对象上，
-   * 细节留给调用方呈现，这一层不吞。
+   * 失败时把上游的 HTTP 状态与响应字段一并挂到错误对象上：这一层不吞、不翻译、
+   * 不替上游下结论，把「到底怎么回事」完整交给调用方。
    */
   async function sendText(account, text) {
     const baseUrl = normalizeBaseUrl(account.baseUrl);
     if (typeof account.botToken !== "string" || !account.botToken || !account.recipient) {
       throw new Error("account_send_not_configured");
     }
-
-    const contextToken = typeof account.contextToken === "string" ? account.contextToken : "";
 
     const endpoint = new URL("ilink/bot/sendmessage", baseUrl);
     const response = await request(
@@ -536,7 +477,6 @@ export function createIlink({ fetch: fetchImpl, channelVersion = "2.4.9", appId 
             client_id: crypto.randomUUID(),
             message_type: 2,
             message_state: 2,
-            ...(contextToken ? { context_token: contextToken } : {}),
             item_list: [{ type: 1, text_item: { text } }],
           },
           base_info: baseInfo(),
@@ -546,60 +486,36 @@ export function createIlink({ fetch: fetchImpl, channelVersion = "2.4.9", appId 
     );
 
     const result = await readJsonFrom(response, MAX_RESPONSE_BYTES);
+    const fields = upstreamFields(result);
     const code = upstreamErrorCode(result);
+    const errmsg = typeof result.errmsg === "string" ? result.errmsg.trim() : "";
+
+    /** 组装失败错误：上游原话 + HTTP 状态，字段名一个都不改。 */
+    function failure(name) {
+      const error = new Error(name);
+      error.upstreamStatus = response.status;
+      error.upstream = { ...fields };
+      // 上游把码放哪个字段并不固定，两个都空时用归一化后的值兜底，
+      // 好让调用方至少知道「它确实报了错」。
+      if (error.upstream.ret === undefined && error.upstream.errcode === undefined && code !== 0) {
+        error.upstream.ret = code;
+      }
+      return error;
+    }
 
     if (!response.ok || code !== 0) {
-      const error = new Error(code === STALE_TOKEN_ERRCODE ? "weixin_bot_token_stale" : "weixin_send_failed");
-      error.upstreamStatus = response.status;
-      if (Number.isInteger(result.ret) && result.ret !== 0) error.upstreamRet = result.ret;
-      if (Number.isInteger(result.errcode) && result.errcode !== 0) error.upstreamErrcode = result.errcode;
-      // 上游把错误码放哪个字段并不固定，两边都空时用归一化后的值兜底。
-      if (error.upstreamRet === undefined && error.upstreamErrcode === undefined && code !== 0) {
-        error.upstreamRet = code;
-      }
-      if (typeof result.errmsg === "string" && result.errmsg) error.upstreamErrmsg = result.errmsg;
-      throw error;
+      throw failure(code === STALE_TOKEN_ERRCODE ? "weixin_bot_token_stale" : "weixin_send_failed");
     }
-    return { messageId: typeof result.message_id === "string" ? result.message_id : null };
+    // ret = 0 但上游写了错误描述：它嘴上说成功，实际给了反对意见，同样不算成功。
+    if (errmsg) throw failure("weixin_send_failed");
+
+    return fields;
   }
 
-  return { startQr, pollQr, pullUpdates, sendText };
+  return { startQr, pollQr, sendText };
 }
 
-/* ================== 四、账号状态与上下文捕获 ================== */
-
-/**
- * 从一轮增量消息中捕获默认收件人的上下文令牌，返回新的账号状态。
- *
- * 纯函数：不修改入参，不产生 I/O。调用方负责把结果写回存储。
- */
-export function applyUpdates(account, updates) {
-  const next = { ...account, getUpdatesBuf: updates.getUpdatesBuf };
-
-  for (const message of updates.messages) {
-    if (!message || message.from_user_id !== account.recipient) continue;
-    const token = message.context_token;
-    if (typeof token !== "string" || !token || token.length > MAX_CONTEXT_TOKEN_LENGTH) continue;
-    if (token === next.contextToken) continue;
-    next.contextToken = token;
-  }
-  return next;
-}
-
-/**
- * 上下文失效（上游 ret=-2）时重置游标。
- *
- * 不重置游标的话，上游会认为消息已消费完毕，重放不出任何带
- * context_token 的历史消息，于是上下文永远补不回来。
- */
-export function invalidateContext(account) {
-  return { ...account, contextToken: "", getUpdatesBuf: "" };
-}
-
-/** 账号状态是否发生实质变化，用于决定要不要写存储。 */
-export function accountChanged(before, after) {
-  return before.contextToken !== after.contextToken || before.getUpdatesBuf !== after.getUpdatesBuf;
-}
+/* ==================== 四、账号记录 ==================== */
 
 /** 生成一条新的账号记录（扫码确认后调用）。 */
 export function createAccount(loginResult, { notifyToken, createdAt = Date.now() } = {}) {
@@ -607,10 +523,7 @@ export function createAccount(loginResult, { notifyToken, createdAt = Date.now()
     botToken: loginResult.botToken,
     botId: loginResult.botId,
     baseUrl: loginResult.baseUrl,
-    scannerUserId: loginResult.scannerUserId,
     recipient: loginResult.scannerUserId,
-    getUpdatesBuf: "",
-    contextToken: "",
     notifyToken,
     createdAt,
   };

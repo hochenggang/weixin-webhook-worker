@@ -27,9 +27,8 @@ export async function getAccount(env) {
 
 export async function putAccount(env, account) {
   if (!account || typeof account.botToken !== "string") throw new Error("invalid_account_record");
-  account.updatedAt = Date.now();
-  await store(env).put(KEY, JSON.stringify(account));
-  return account;
+  // 不改入参：调用方拿到的账号对象保持原样。
+  await store(env).put(KEY, JSON.stringify({ ...account, updatedAt: Date.now() }));
 }
 
 /**

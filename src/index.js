@@ -6,7 +6,7 @@
  *
  * 路由：
  *   GET  /                 → 跳转 /init
- *   GET  /init             → 初始化页（已绑定则 404）
+ *   GET  /init             → 初始化页（只在未绑定时可访问，已绑定则 404）
  *   POST /api/init/start   → 申请二维码
  *   POST /api/init/poll    → 推进扫码状态；确认后返回令牌
  *   POST /notify           → 实时转发文本
@@ -14,6 +14,7 @@
  */
 
 import QRCode from "qrcode-svg";
+
 import {
   createAccount,
   createIlink,
@@ -25,7 +26,7 @@ import {
   tokenMatches,
   TICKET_SECONDS,
 } from "./common.js";
-import { INIT_PAGE } from "./init-page.js";
+import INIT_PAGE from "./init.html";
 import { getAccount, getOrCreateSigningSecret, putAccount } from "./store.js";
 
 const MAX_BODY_BYTES = 16 * 1024;
@@ -126,10 +127,14 @@ function configuredSecret(env) {
 /* ---------------------------- 初始化 ---------------------------- */
 
 /**
- * 初始化页：未绑定返回扫码页；已绑定返回 404。
+ * 初始化页的可用条件：
  *
- * 需要重新绑定时，到 Cloudflare 控制台的 KV 里删掉 account 这个 key，
- * 页面即恢复可访问（见 README）。
+ * - **未绑定**（KV 里没有 `account`）→ 返回扫码页。
+ * - **已绑定** → 404，页面不再暴露。
+ *
+ * 这是有意为之：重新绑定**只能**去 Cloudflare 控制台删掉 KV 里的 `account` 键
+ * （见 README）。服务端不提供任何解绑接口——少一个能删数据的入口，
+ * 就少一类风险，而这件事本来也不常做。
  */
 async function handleInitPage(request, env) {
   if (request.method !== "GET") return methodNotAllowed(["GET"]);
@@ -226,12 +231,12 @@ function buildCurl(endpoint, token) {
 /**
  * 发送文本通知。
  *
- * 默认**不带 `context_token`**：它在官方实现里是可选的会话标识，缺失时只记
- * 一条告警、照常发送；带上它却要先跑一轮 getupdates 长轮询（实测挂起约
- * 18 秒），等于把延迟灌进通知链路。
+ * 请求体按协议构造，协议里可选的 `context_token` 不发：它是「回复某条会话」时的
+ * 关联字段，而本服务单向推送、不接收消息，没有会话可回复。省掉它就不必为了拿到它
+ * 去跑 `getupdates` 长轮询（实测挂起约 18 秒）。
  *
- * 失败不做任何补救——把上游返回的 status / ret / errcode / errmsg 原样带出去，
- * 让调用方看到失败的真实原因，而不是一个被我们翻译过的模糊结论。
+ * 响应**原样透传上游字段**（`ret` / `errcode` / `errmsg`）：协议说 `ret: 0`
+ * 表示成功、`errmsg` 是错误描述，那就照这个事实回答，不额外发明判据。
  */
 async function handleNotify(request, env) {
   if (request.method !== "POST") return methodNotAllowed(["POST"]);
@@ -251,11 +256,17 @@ async function handleNotify(request, env) {
   }
 
   const { ilink } = context(env);
-  const result = await ilink.sendText(account, text);
-  return json({ ok: true, messageId: result.messageId });
+  const upstream = await ilink.sendText(account, text);
+  return json({ ok: true, ...upstream });
 }
 
 /* ---------------------------- 错误映射 ---------------------------- */
+
+/**
+ * 这两类错误要连上游字段一起回答，所以不走下面那张静态表。
+ * `weixin_bot_token_stale`（上游报 -14）重试没有意义，只能重新扫码。
+ */
+const UPSTREAM_FAILURES = new Set(["weixin_send_failed", "weixin_bot_token_stale"]);
 
 const ERROR_STATUSES = new Map([
   ["ticket_secret_not_configured", 503],
@@ -281,9 +292,6 @@ const ERROR_STATUSES = new Map([
   ["invalid_weixin_base_url", 502],
   ["invalid_weixin_redirect_host", 502],
   ["invalid_weixin_login_response", 502],
-  ["weixin_send_failed", 502],
-  ["weixin_updates_failed", 502],
-  ["invalid_weixin_updates_response", 502],
   ["qr_render_failed", 502],
 ]);
 
@@ -292,17 +300,14 @@ function safeErrorResponse(error) {
 
   const code = typeof error?.message === "string" ? error.message : "";
 
-  // 上游拒绝时把它的原话一并带出：调用方要的是可诊断的事实，不是转述。
-  if (code === "weixin_send_failed" || code === "weixin_bot_token_stale") {
+  // 上游没有接受这次发送：把它的状态与响应字段原样摊在响应体里。
+  // 字段名沿用协议里的名字（ret / errcode / errmsg），不做任何重命名。
+  if (UPSTREAM_FAILURES.has(code)) {
     return json({
       ok: false,
       error: code,
       ...(Number.isInteger(error.upstreamStatus) ? { upstreamStatus: error.upstreamStatus } : {}),
-      ...(Number.isInteger(error.upstreamRet) ? { upstreamRet: error.upstreamRet } : {}),
-      ...(Number.isInteger(error.upstreamErrcode) ? { upstreamErrcode: error.upstreamErrcode } : {}),
-      ...(typeof error.upstreamErrmsg === "string" && error.upstreamErrmsg
-        ? { upstreamErrmsg: error.upstreamErrmsg }
-        : {}),
+      ...(error.upstream && typeof error.upstream === "object" ? error.upstream : {}),
     }, code === "weixin_bot_token_stale" ? 503 : 502);
   }
 

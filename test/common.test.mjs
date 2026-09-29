@@ -6,16 +6,15 @@
 
 import assert from "node:assert/strict";
 import {
-  accountChanged,
-  applyUpdates,
   createAccount,
   createIlink,
   createTicketSigner,
-  invalidateContext,
+  MAX_TEXT_LENGTH,
   normalizeText,
   normalizeVerifyCode,
   randomToken,
   readBearerToken,
+  STALE_TOKEN_ERRCODE,
   tokenMatches,
 } from "../src/common.js";
 
@@ -37,15 +36,16 @@ function makeUpstream() {
   const log = [];
   const state = {
     qrStatus: "wait",
-    /** getupdates 的回复队列，按调用次序弹出 */
-    updates: [],
     /** 下一次 sendmessage 的 ret（0 = 成功），消费一次后复位 */
     sendRet: 0,
     /** 下一次 sendmessage 的 errcode，消费一次后复位 */
     sendErrcode: 0,
     sendErrmsg: "跨域请求被上游拒绝",
-    /** 前 N 次 getupdates / get_qrcode_status 直接网络失败（模拟长轮询中断） */
-    updatesNetworkFailTimes: 0,
+    /** 成功响应里附带的 errmsg（正常是空串），消费一次后复位 */
+    sendSuccessErrmsg: "",
+    /** 成功响应里额外塞的 message_id：协议没有这个字段，用来验证我们不把它当判据 */
+    sendMessageId: "MSG-X",
+    /** 前 N 次 get_qrcode_status 直接网络失败（模拟长轮询中断） */
     qrNetworkFailTimes: 0,
   };
 
@@ -76,22 +76,22 @@ function makeUpstream() {
       }
       return Response.json({ status: state.qrStatus });
     }
-    if (path.endsWith("/getupdates")) {
-      if (state.updatesNetworkFailTimes > 0) {
-        state.updatesNetworkFailTimes -= 1;
-        throw new Error("socket hang up");
-      }
-      const next = state.updates.shift() || { ret: 0, get_updates_buf: body.get_updates_buf, msgs: [] };
-      return Response.json(next);
-    }
     if (path.endsWith("/sendmessage")) {
       const ret = state.sendRet;
       const errcode = state.sendErrcode;
+      const successErrmsg = state.sendSuccessErrmsg;
+      const messageId = state.sendMessageId;
       state.sendRet = 0;
       state.sendErrcode = 0;
+      state.sendSuccessErrmsg = "";
+      state.sendMessageId = "MSG-X";
       if (ret !== 0) return Response.json({ ret, errmsg: state.sendErrmsg });
       if (errcode !== 0) return Response.json({ ret: 0, errcode, errmsg: state.sendErrmsg });
-      return Response.json({ ret: 0, message_id: "MSG-X" });
+      return Response.json({
+        ret: 0,
+        errmsg: successErrmsg,
+        ...(messageId === null ? {} : { message_id: messageId }),
+      });
     }
     throw new Error("unexpected upstream path: " + path);
   };
@@ -141,7 +141,7 @@ await test("normalizeText 拒绝空串与纯空白", () => {
   assert.throws(() => normalizeText(null), /text_required/);
 });
 await test("normalizeText 拒绝超长文本", () => {
-  assert.throws(() => normalizeText("a".repeat(4001)), /text_too_long/);
+  assert.throws(() => normalizeText("a".repeat(MAX_TEXT_LENGTH + 1)), /text_too_long/);
 });
 await test("normalizeVerifyCode 放行 undefined 与合法数字", () => {
   assert.equal(normalizeVerifyCode(undefined), undefined);
@@ -306,81 +306,8 @@ await test("pollQr 拒绝非法 baseUrl（非 https）", async () => {
     /invalid_weixin_base_url/,
   );
 });
-await test("pullUpdates 返回游标与消息", async () => {
-  const upstream = makeUpstream();
-  upstream.state.updates.push({
-    ret: 0,
-    get_updates_buf: "BUF-9",
-    msgs: [{ from_user_id: "USER-X", context_token: "CTX-9" }],
-  });
-  const result = await ilinkOf(upstream).pullUpdates({ baseUrl: "https://a/", botToken: "t", getUpdatesBuf: "" });
-  assert.equal(result.getUpdatesBuf, "BUF-9");
-  assert.equal(result.messages.length, 1);
-});
-await test("pullUpdates 对 ret!=0 报错", async () => {
-  const upstream = makeUpstream();
-  upstream.state.updates.push({ ret: 500 });
-  await assert.rejects(
-    () => ilinkOf(upstream).pullUpdates({ baseUrl: "https://a/", botToken: "t" }),
-    /weixin_updates_failed/,
-  );
-});
 
 /* ---------------- 长轮询重试：把瞬时失败消化在内部 ---------------- */
-
-await test("pullUpdates 瞬时网络失败后自动重试并成功", async () => {
-  const upstream = makeUpstream();
-  upstream.state.updatesNetworkFailTimes = 2;
-  upstream.state.updates.push({ ret: 0, get_updates_buf: "BUF-OK", msgs: [] });
-  const result = await ilinkOf(upstream).pullUpdates({ baseUrl: "https://a/", botToken: "t" });
-  assert.equal(result.getUpdatesBuf, "BUF-OK", "重试后应拿到正常结果");
-  assert.equal(
-    upstream.log.filter((entry) => entry.path.endsWith("/getupdates")).length,
-    3,
-    "应重试 2 次后成功（共 3 次请求）",
-  );
-});
-await test("pullUpdates 业务错误(ret!=0)不重试，直接抛出", async () => {
-  const upstream = makeUpstream();
-  upstream.state.updates.push({ ret: 500 });
-  await assert.rejects(
-    () => ilinkOf(upstream).pullUpdates({ baseUrl: "https://a/", botToken: "t" }),
-    /weixin_updates_failed/,
-  );
-  assert.equal(
-    upstream.log.filter((entry) => entry.path.endsWith("/getupdates")).length,
-    1,
-    "确定性业务错误只应请求一次",
-  );
-});
-await test("pullUpdates 透传服务端建议的 longpolling_timeout_ms", async () => {
-  const upstream = makeUpstream();
-  upstream.state.updates.push({ ret: 0, get_updates_buf: "BUF-1", msgs: [], longpolling_timeout_ms: 20000 });
-  const result = await ilinkOf(upstream).pullUpdates({ baseUrl: "https://a/", botToken: "t" });
-  assert.equal(result.longpollingTimeoutMs, 20000, "应把服务端建议的超时带出来供下次使用");
-});
-await test("pullUpdates 支持只拉一轮（attempts=1 不重试）", async () => {
-  const upstream = makeUpstream();
-  upstream.state.updatesNetworkFailTimes = 5;
-  await assert.rejects(
-    () => ilinkOf(upstream).pullUpdates({ baseUrl: "https://a/", botToken: "t" }, { attempts: 1 }),
-    /weixin_upstream_unreachable/,
-  );
-  assert.equal(
-    upstream.log.filter((entry) => entry.path.endsWith("/getupdates")).length,
-    1,
-    "attempts=1 只应请求一次，不给调用方叠加 40 秒等待",
-  );
-});
-await test("pullUpdates errcode=-14 归类为 bot 令牌失活", async () => {
-  const upstream = makeUpstream();
-  upstream.state.updates.push({ ret: 0, errcode: -14, errmsg: "session timeout" });
-  const error = await ilinkOf(upstream)
-    .pullUpdates({ baseUrl: "https://a/", botToken: "t" })
-    .then(() => null, (caught) => caught);
-  assert.equal(error.message, "weixin_bot_token_stale");
-  assert.equal(error.upstreamErrmsg, "session timeout");
-});
 await test("pollQr 瞬时网络失败后自动重试并成功", async () => {
   const upstream = makeUpstream();
   upstream.state.qrNetworkFailTimes = 1;
@@ -406,125 +333,78 @@ await test("pollQr 持续失败时最终抛出，不会无限重试", async () =
     "重试预算耗尽后应停止（默认 3 次）",
   );
 });
-await test("sendText 无 contextToken 也能发送，且请求体省略该字段", async () => {
+await test("sendText 请求体不带 context_token（单向推送没有会话可回复）", async () => {
   const upstream = makeUpstream();
   const result = await ilinkOf(upstream).sendText({ baseUrl: "https://a/", botToken: "t", recipient: "r" }, "hi");
-  assert.equal(result.messageId, "MSG-X");
+  assert.equal(result.ret, 0);
   const sent = upstream.log.at(-1).body;
-  assert.equal("context_token" in sent.msg, false, "空令牌时不应出现 context_token 字段");
-});
-await test("sendText 有 contextToken 时原样回带", async () => {
-  const upstream = makeUpstream();
-  await ilinkOf(upstream).sendText(
-    { baseUrl: "https://a/", botToken: "t", recipient: "r", contextToken: "CTX-1" },
-    "hi",
-  );
-  assert.equal(upstream.log.at(-1).body.msg.context_token, "CTX-1");
+  assert.equal("context_token" in sent.msg, false, "不应出现 context_token 字段");
 });
 await test("sendText 缺收件人时报错", async () => {
   const upstream = makeUpstream();
   await assert.rejects(
-    () => ilinkOf(upstream).sendText({ baseUrl: "https://a/", botToken: "t", contextToken: "c" }, "hi"),
+    () => ilinkOf(upstream).sendText({ baseUrl: "https://a/", botToken: "t" }, "hi"),
     /account_send_not_configured/,
   );
 });
-await test("sendText ret!=0 时带出 ret 与上游 errmsg", async () => {
+await test("sendText ret!=0 时把上游的 ret 与 errmsg 原样带出", async () => {
   const upstream = makeUpstream();
   upstream.state.sendRet = -2;
   const error = await ilinkOf(upstream)
     .sendText({ baseUrl: "https://a/", botToken: "t", recipient: "r" }, "hi")
     .then(() => null, (caught) => caught);
   assert.equal(error.message, "weixin_send_failed");
-  assert.equal(error.upstreamRet, -2);
-  assert.equal(error.upstreamErrmsg, "跨域请求被上游拒绝", "应把上游原话带出来供诊断");
+  assert.equal(error.upstreamStatus, 200);
+  assert.equal(error.upstream.ret, -2, "字段名用协议里的 ret，不改名");
+  assert.equal(error.upstream.errmsg, "跨域请求被上游拒绝", "上游原话要能带出来");
 });
 await test("sendText errcode=-14 归类为 bot 令牌失活", async () => {
   const upstream = makeUpstream();
-  upstream.state.sendErrcode = -14;
+  upstream.state.sendErrcode = STALE_TOKEN_ERRCODE;
   const error = await ilinkOf(upstream)
     .sendText({ baseUrl: "https://a/", botToken: "t", recipient: "r" }, "hi")
     .then(() => null, (caught) => caught);
   assert.equal(error.message, "weixin_bot_token_stale");
-  assert.equal(error.upstreamErrcode, -14, "应带出上游 errcode 供诊断");
+  assert.equal(error.upstream.errcode, STALE_TOKEN_ERRCODE, "应带出上游 errcode 供诊断");
 });
-await test("sendText 成功返回 messageId", async () => {
+await test("sendText ret=0 但 errmsg 非空时不得算成功", async () => {
+  // 上游「嘴上说成功、实际附了错误描述」——这正是我们以前会误报 ok 的情形。
+  const upstream = makeUpstream();
+  upstream.state.sendSuccessErrmsg = "content_miss";
+  const error = await ilinkOf(upstream)
+    .sendText({ baseUrl: "https://a/", botToken: "t", recipient: "r" }, "hi")
+    .then(() => null, (caught) => caught);
+  assert.equal(error.message, "weixin_send_failed");
+  assert.equal(error.upstream.ret, 0, "上游说什么就照抄什么");
+  assert.equal(error.upstream.errmsg, "content_miss", "错误描述不能被吞掉");
+});
+await test("sendText 成功时原样返回上游字段，不多带协议外的字段", async () => {
   const upstream = makeUpstream();
   const result = await ilinkOf(upstream).sendText(
-    { baseUrl: "https://a/", botToken: "t", recipient: "r", contextToken: "c" },
+    { baseUrl: "https://a/", botToken: "t", recipient: "r" },
     "hi",
   );
-  assert.equal(result.messageId, "MSG-X");
+  // 上游响应里塞了一个协议没定义的 message_id，我们不应把它带进响应。
+  assert.deepEqual(result, { ret: 0, errmsg: "" });
 });
 await test("未注入 fetch 时立即报错", () => {
   assert.throws(() => createIlink({}), /fetch_not_injected/);
 });
 
-/* ==================== 上下文捕获与状态演进 ==================== */
+/* ==================== 账号记录 ==================== */
 
-console.log("\n[状态] 上下文捕获与游标策略");
-const baseAccount = { recipient: "USER-X", contextToken: "", getUpdatesBuf: "" };
-
-await test("applyUpdates 捕获默认收件人的上下文", () => {
-  const next = applyUpdates(baseAccount, {
-    getUpdatesBuf: "BUF-1",
-    messages: [{ from_user_id: "USER-X", context_token: "CTX-1" }],
-  });
-  assert.equal(next.contextToken, "CTX-1");
-  assert.equal(next.getUpdatesBuf, "BUF-1");
-});
-await test("applyUpdates 忽略其他发送者", () => {
-  const next = applyUpdates(baseAccount, {
-    getUpdatesBuf: "BUF-1",
-    messages: [{ from_user_id: "SOMEONE-ELSE", context_token: "CTX-2" }],
-  });
-  assert.equal(next.contextToken, "");
-});
-await test("applyUpdates 忽略超长上下文令牌", () => {
-  const next = applyUpdates(baseAccount, {
-    getUpdatesBuf: "BUF-1",
-    messages: [{ from_user_id: "USER-X", context_token: "c".repeat(8193) }],
-  });
-  assert.equal(next.contextToken, "");
-});
-await test("applyUpdates 不修改入参", () => {
-  const original = { ...baseAccount };
-  applyUpdates(original, {
-    getUpdatesBuf: "BUF-1",
-    messages: [{ from_user_id: "USER-X", context_token: "CTX-1" }],
-  });
-  assert.equal(original.contextToken, "");
-  assert.equal(original.getUpdatesBuf, "");
-});
-await test("applyUpdates 取最后一条有效上下文", () => {
-  const next = applyUpdates(baseAccount, {
-    getUpdatesBuf: "BUF-1",
-    messages: [
-      { from_user_id: "USER-X", context_token: "CTX-OLD" },
-      { from_user_id: "USER-X", context_token: "CTX-NEW" },
-    ],
-  });
-  assert.equal(next.contextToken, "CTX-NEW");
-});
-await test("invalidateContext 同时清空上下文与游标", () => {
-  const broken = { ...baseAccount, contextToken: "CTX-1", getUpdatesBuf: "BUF-1" };
-  const reset = invalidateContext(broken);
-  assert.equal(reset.contextToken, "");
-  assert.equal(reset.getUpdatesBuf, "", "游标必须一起清空，否则上游不会重放");
-});
-await test("accountChanged 识别真实变化", () => {
-  assert.equal(accountChanged(baseAccount, { ...baseAccount }), false);
-  assert.equal(accountChanged(baseAccount, { ...baseAccount, contextToken: "CTX-1" }), true);
-  assert.equal(accountChanged(baseAccount, { ...baseAccount, getUpdatesBuf: "BUF-1" }), true);
-});
-await test("createAccount 默认收件人为扫码用户且状态为空", () => {
+console.log("\n[账号] 扫码结果 → 账号记录");
+await test("createAccount 只保留推送链路需要的字段", () => {
   const account = createAccount(
     { botToken: "t", botId: "b", baseUrl: "https://a/", scannerUserId: "USER-X" },
     { notifyToken: "NT" },
   );
-  assert.equal(account.recipient, "USER-X");
-  assert.equal(account.contextToken, "");
-  assert.equal(account.getUpdatesBuf, "");
-  assert.equal(account.notifyToken, "NT");
+  assert.deepEqual(
+    Object.keys(account).sort(),
+    ["baseUrl", "botId", "botToken", "createdAt", "notifyToken", "recipient"],
+  );
+  assert.equal(account.recipient, "USER-X", "默认收件人就是扫码用户");
+  assert.ok(Number.isSafeInteger(account.createdAt), "createdAt 应为毫秒时间戳");
 });
 
 console.log(`\n结果：${passed} 通过，${failed} 失败\n`);

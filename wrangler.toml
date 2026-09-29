@@ -3,6 +3,11 @@ main = "src/index.js"
 compatibility_date = "2026-09-20"
 workers_dev = true
 
+# 页面文件 src/init.html 由 src/index.js 直接 import。
+# wrangler 默认就把 .html 当文本模块打包（内置规则 Text for **/*.html），
+# 因此这里不需要额外的 [[rules]]——Worker 运行时没有文件系统，
+# 「读取 init.html」发生在打包阶段，源文件保持为真正的 HTML。
+
 [[kv_namespaces]]
 binding = "WEIXIN_KV"
 

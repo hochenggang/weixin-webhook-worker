@@ -22,7 +22,6 @@ import QRCode from "qrcode-svg";
 import {
   createAccount,
   createIlink,
-  createTicketSigner,
   normalizeText,
   randomToken,
   TICKET_SECONDS,
@@ -71,14 +70,21 @@ function makeIlink() {
   });
 }
 
-/** 把上游拒绝的细节拼成一行，终端里一眼能看到真实原因。 */
+/** 把上游返回的字段原样拼成一行，终端里一眼能看到真实原因。 */
 function upstreamDetail(error) {
+  const upstream = error.upstream && typeof error.upstream === "object" ? error.upstream : {};
   return [
     error.upstreamStatus ? `status=${error.upstreamStatus}` : "",
-    error.upstreamRet !== undefined ? `ret=${error.upstreamRet}` : "",
-    error.upstreamErrcode !== undefined ? `errcode=${error.upstreamErrcode}` : "",
-    error.upstreamErrmsg ? `errmsg=${error.upstreamErrmsg}` : "",
+    upstream.ret !== undefined ? `ret=${upstream.ret}` : "",
+    upstream.errcode !== undefined ? `errcode=${upstream.errcode}` : "",
+    upstream.errmsg ? `errmsg=${upstream.errmsg}` : "",
   ].filter(Boolean).join(" ");
+}
+
+/** 生成提醒：这两种情况都是「对方得先发条消息」。 */
+function printWindowHint() {
+  console.error(mid("上游没有接受这条消息。最常见的原因是收件人的 24 小时回复窗口已关闭："));
+  console.error(dim("让对方在微信里给这个机器人发一条消息，窗口与 10 条配额就会重置。\n"));
 }
 
 /* ============================ 二维码渲染 ============================ */
@@ -185,7 +191,6 @@ async function cmdLogin() {
   }
 
   console.log(dim("正在向微信申请二维码…"));
-  const signer = createTicketSigner({ secret: randomToken(32) });
   const qr = await ilink.startQr([]);
 
   const rendered = renderQr(qr.qrcodeImgContent);
@@ -300,7 +305,7 @@ async function cmdSend(text) {
   console.log(bold("\n发送通知\n"));
   try {
     const result = await ilink.sendText(session, normalized);
-    console.log(deep(`\n已发送。messageId = ${result.messageId ?? "(上游未返回)"}\n`));
+    console.log(deep(`\n已发送。上游返回：${JSON.stringify(result)}\n`));
   } catch (error) {
     const code = error?.message || "internal_error";
     const extra = upstreamDetail(error);
@@ -308,9 +313,8 @@ async function cmdSend(text) {
 
     if (code === "weixin_bot_token_stale") {
       console.error(dim("机器人令牌已失活，需要 logout 后重新 login 扫码。\n"));
-    } else if (error.upstreamRet === -2 || error.upstreamErrcode === -2) {
-      console.error(mid("上游不接受这条会话。最常见的原因是收件人的 24 小时回复窗口已关闭："));
-      console.error(dim("让对方在微信里给这个机器人发一条消息，窗口与 10 条配额就会重置。\n"));
+    } else if (code === "weixin_send_failed") {
+      printWindowHint();
     }
     process.exit(1);
   }
